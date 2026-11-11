@@ -8,7 +8,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # URL твоего репозитория — ЗАМЕНИ НА СВОЙ!
-REPO_URL="https://raw.githubusercontent.com/ТВОЙ_НИК/ai-agent/main/agent.py"
+REPO_URL="https://raw.githubusercontent.com/vasa57kam/ag/main/agent.py"
 
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║     🧠 Ultimate AI Agent v4.0 — GitHub Install               ║${NC}"
