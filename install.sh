@@ -7,9 +7,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# URL твоего репозитория — ЗАМЕНИ НА СВОЙ!
-REPO_URL="https://raw.githubusercontent.com/vasa57kam/ag/main/agent.py"
-
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║     🧠 Ultimate AI Agent v4.0 — GitHub Install               ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -83,7 +80,7 @@ echo -e "   ✅ Готово."
 echo ""
 
 # === 4. ЗАВИСИМОСТИ ===
-echo -e "${YELLOW}[4/5] 📦 Зависимости...${NC}"
+echo -e "${YELLOW}[4/5]  Зависимости...${NC}"
 apt install -y python3-pip sqlite3 smartmontools e2fsprogs curl > /dev/null 2>&1
 pip3 install flask openai paramiko flask-cors > /dev/null 2>&1
 echo -e "   ✅ Готово."
@@ -94,7 +91,7 @@ echo -e "${YELLOW}[5/5] 🧠 Скачивание агента с GitHub...${NC}
 mkdir -p /opt/ai-agent/workspace
 
 # Скачиваем agent.py с GitHub
-curl -fsSL "$REPO_URL" -o /opt/ai-agent/agent.py
+curl -fsSL "https://raw.githubusercontent.com/vasa57kam/ag/main/agent.py" -o /opt/ai-agent/agent.py
 
 # Заменяем модель в коде на выбранную
 sed -i "s|MODEL = \"qwen2.5-coder:14b\"|MODEL = \"$MODEL\"|g" /opt/ai-agent/agent.py
@@ -128,10 +125,10 @@ echo -e "${GREEN}║                   ✅ УСТАНОВКА ЗАВЕРШЕНА
 echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${GREEN}║${NC}  🌐 Открой: ${BLUE}http://$IP:8000${NC}                                ${GREEN}║${NC}"
 echo -e "${GREEN}║${NC}  🧠 Модель: ${BLUE}$MODEL${NC}                                  ${GREEN}║${NC}"
-echo -e "${GREEN}║${NC}  💾 История в SQLite | 🔄 Смена моделей | 💿 Проверка диска  ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}   История в SQLite | 🔄 Смена моделей |  Проверка диска  ${GREEN}║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${YELLOW}📝 Для обновления агента в будущем:${NC}"
-echo -e "   curl -fsSL $REPO_URL -o /opt/ai-agent/agent.py"
+echo -e "   curl -fsSL https://raw.githubusercontent.com/vasa57kam/ag/main/agent.py -o /opt/ai-agent/agent.py"
 echo -e "   systemctl restart ai-agent"
 echo ""
