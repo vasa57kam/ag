@@ -1,134 +1,70 @@
 #!/bin/bash
 set -e
+G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; N='\033[0m'
+REPO="https://raw.githubusercontent.com/vasa57kam/ag/main"
+echo -e "${B}=== AI Agent v6 install ===${N}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║     🧠 Ultimate AI Agent v4.0 — GitHub Install               ║${NC}"
-echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
-echo ""
-
-# === 1. ДИСК ===
-echo -e "${YELLOW}[1/5] 🔍 Диск...${NC}"
+# 1. Диск
 ROOT_DEV=$(df / | tail -1 | awk '{print $1}')
-DISK_NAME=$(echo $ROOT_DEV | sed 's/[0-9]*$//')
-PART_NUM=$(echo $ROOT_DEV | grep -oE '[0-9]+$' || echo "1")
-DISK_SIZE=$(lsblk -b -d -n -o SIZE $DISK_NAME 2>/dev/null || echo 0)
-PART_SIZE=$(lsblk -b -n -o SIZE $ROOT_DEV 2>/dev/null || echo 0)
-FREE_GB=$((($DISK_SIZE - $PART_SIZE) / 1024 / 1024 / 1024))
-
-if [ "$FREE_GB" -gt 5 ]; then
-    apt update > /dev/null 2>&1 && apt install -y cloud-guest-utils > /dev/null 2>&1
-    if echo "$ROOT_DEV" | grep -q "/dev/mapper/"; then
-        growpart $DISK_NAME $PART_NUM 2>/dev/null || true
-        pvresize $DISK_NAME$PART_NUM 2>/dev/null || true
-        lvextend -l +100%FREE $(df / | tail -1 | awk '{print $1}') 2>/dev/null || true
-        resize2fs $(df / | tail -1 | awk '{print $1}') > /dev/null 2>&1 || true
-    else
-        growpart $DISK_NAME $PART_NUM 2>/dev/null || true
-        resize2fs $ROOT_DEV > /dev/null 2>&1 || true
-    fi
-    echo -e "   ✅ Расширен."
-else
-    echo -e "   ⚠️ Расширение не требуется."
+DISK=$(echo $ROOT_DEV | sed 's/[0-9]*$//'); PART=$(echo $ROOT_DEV | grep -oE '[0-9]+$' || echo 1)
+DS=$(lsblk -b -d -n -o SIZE $DISK 2>/dev/null || echo 0); PS=$(lsblk -b -n -o SIZE $ROOT_DEV 2>/dev/null || echo 0)
+if [ $(( (DS-PS)/1024/1024/1024 )) -gt 5 ]; then
+  apt update -qq && apt install -y -qq cloud-guest-utils
+  growpart $DISK $PART || true
+  if echo "$ROOT_DEV" | grep -q mapper; then
+    pvresize ${DISK}${PART} || true; lvextend -l +100%FREE $ROOT_DEV || true
+  fi
+  resize2fs $ROOT_DEV || true
+  echo -e "${G}диск расширен${N}"
 fi
-AVAILABLE_DISK=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
-echo ""
 
-# === 2. RAM И МОДЕЛЬ ===
-echo -e "${YELLOW}[2/5] 🔍 RAM и модель...${NC}"
-TOTAL_RAM=$(free -g | awk '/^Mem:/{print $2}')
-echo -e "   💾 RAM: ${GREEN}${TOTAL_RAM} ГБ${NC} | 💿 Диск: ${GREEN}${AVAILABLE_DISK} ГБ${NC}"
-echo ""
-echo -e "${BLUE}Выбор модели:${NC}"
-echo -e "   ${GREEN}1)${NC} Qwen 2.5 Coder 32B (Q4) — Макс. ум (~22 ГБ RAM)"
-echo -e "   ${GREEN}2)${NC} Qwen 2.5 Coder 32B (Q3_K_M) — Ум + сжатие (~17 ГБ) ⭐"
-echo -e "   ${GREEN}3)${NC} Qwen 2.5 Coder 14B — Баланс (~10 ГБ)"
-echo -e "   ${GREEN}4)${NC} Qwen 2.5 Coder 7B — Скорость (~6 ГБ)"
+# 2. Модель
+RAM=$(free -g | awk '/^Mem:/{print $2}')
+echo -e "RAM: ${G}${RAM} ГБ${N}"
+echo "1) 32B Q4 (~22 ГБ)  2) 32B Q3 (~17 ГБ)  3) 14B (~10 ГБ)  4) 7B (~6 ГБ)"
+read -p "Модель [3]: " CH; CH=${CH:-3}
+case $CH in
+ 1) MODEL=qwen2.5-coder:32b;; 2) MODEL=qwen2.5-coder:32b-q3_K_M;;
+ 4) MODEL=qwen2.5-coder:7b;; *) MODEL=qwen2.5-coder:14b;;
+esac
 
-while true; do
-    read -p "👉 Номер (1-4): " CHOICE
-    case $CHOICE in
-        1) MODEL="qwen2.5-coder:32b"; REQ=22; break ;;
-        2) MODEL="qwen2.5-coder:32b-q3_K_M"; REQ=17; break ;;
-        3) MODEL="qwen2.5-coder:14b"; REQ=10; break ;;
-        4) MODEL="qwen2.5-coder:7b"; REQ=6; break ;;
-        *) echo -e "   ${RED}Неверно.${NC}" ;;
-    esac
-done
-
-if [ "$TOTAL_RAM" -lt "$REQ" ]; then
-    echo -e "   ${YELLOW}⚠️ RAM меньше рекомендуемой ($REQ ГБ). Модель может тормозить.${NC}"
-    read -p "   Продолжить? (да/нет): " C
-    if [[ "$C" != "да" && "$C" != "y" ]]; then exit 1; fi
-fi
-echo ""
-
-# === 3. OLLAMA ===
-echo -e "${YELLOW}[3/5] 🦙 Ollama...${NC}"
-if ! command -v ollama &> /dev/null; then
-    curl -fsSL https://ollama.com/install.sh | bash
-    systemctl enable ollama && systemctl start ollama
-fi
-echo -e "   ⏳ Скачивание $MODEL (не закрывай терминал)..."
+# 3. Ollama + модель
+command -v ollama >/dev/null || { curl -fsSL https://ollama.com/install.sh | bash; }
+systemctl enable --now ollama
 ollama pull $MODEL
-echo -e "   ✅ Готово."
-echo ""
 
-# === 4. ЗАВИСИМОСТИ ===
-echo -e "${YELLOW}[4/5]  Зависимости...${NC}"
-apt install -y python3-pip sqlite3 smartmontools e2fsprogs curl > /dev/null 2>&1
-pip3 install flask openai paramiko flask-cors > /dev/null 2>&1
-echo -e "   ✅ Готово."
-echo ""
+# 4. Зависимости (openai больше не нужен!)
+apt install -y -qq python3-pip sqlite3 smartmontools e2fsprogs curl git
+pip3 install -q flask paramiko 2>/dev/null || pip3 install -q --break-system-packages flask paramiko
 
-# === 5. СКАЧИВАЕМ АГЕНТА С GITHUB ===
-echo -e "${YELLOW}[5/5] 🧠 Скачивание агента с GitHub...${NC}"
+# 5. Агент + конфиг
 mkdir -p /opt/ai-agent/workspace
+curl -fsSL "$REPO/agent.py" -o /opt/ai-agent/agent.py
+python3 - "$MODEL" <<'PY'
+import json,sys,os
+p="/opt/ai-agent/config.json"; cfg={}
+if os.path.exists(p): cfg=json.load(open(p))
+cfg["model"]=sys.argv[1]; cfg.setdefault("num_ctx",0); cfg.setdefault("ssh",{}); cfg.setdefault("default_host","")
+cfg.pop("web_password",None)
+json.dump(cfg,open(p,"w"),indent=2)
+PY
 
-# Скачиваем agent.py с GitHub
-curl -fsSL "https://raw.githubusercontent.com/vasa57kam/ag/main/agent.py" -o /opt/ai-agent/agent.py
-
-# Заменяем модель в коде на выбранную
-sed -i "s|MODEL = \"qwen2.5-coder:14b\"|MODEL = \"$MODEL\"|g" /opt/ai-agent/agent.py
-
-echo -e "   ✅ Скачан и настроен."
-echo ""
-
-# === 6. SYSTEMD ===
-echo -e "${YELLOW}[6/6] ⚙️ Автозапуск...${NC}"
-cat > /etc/systemd/system/ai-agent.service << 'SEOF'
+# 6. Сервис
+cat > /etc/systemd/system/ai-agent.service <<'EOF'
 [Unit]
-Description=Ultimate AI Agent v4
-After=network.target ollama.service
+Description=AI Agent v6
+After=network-online.target ollama.service
+Wants=ollama.service
 [Service]
 User=root
 WorkingDirectory=/opt/ai-agent
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/ai-agent/agent.py
 Restart=always
-RestartSec=10
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
-SEOF
-systemctl daemon-reload
-systemctl enable ai-agent
-systemctl restart ai-agent
-
-IP=$(hostname -I | awk '{print $1}')
-echo ""
-echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║                   ✅ УСТАНОВКА ЗАВЕРШЕНА!                    ║${NC}"
-echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║${NC}  🌐 Открой: ${BLUE}http://$IP:8000${NC}                                ${GREEN}║${NC}"
-echo -e "${GREEN}║${NC}  🧠 Модель: ${BLUE}$MODEL${NC}                                  ${GREEN}║${NC}"
-echo -e "${GREEN}║${NC}   История в SQLite | 🔄 Смена моделей |  Проверка диска  ${GREEN}║${NC}"
-echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
-echo ""
-echo -e "${YELLOW}📝 Для обновления агента в будущем:${NC}"
-echo -e "   curl -fsSL https://raw.githubusercontent.com/vasa57kam/ag/main/agent.py -o /opt/ai-agent/agent.py"
-echo -e "   systemctl restart ai-agent"
-echo ""
+EOF
+systemctl daemon-reload && systemctl enable --now ai-agent
+sleep 2
+echo -e "${G}ГОТОВО: http://$(hostname -I | awk '{print $1}'):8000 | модель $MODEL${N}"
