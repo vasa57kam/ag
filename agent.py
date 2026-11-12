@@ -111,14 +111,21 @@ def handle_action(act):
         elif a == "ssh":
             host = act.get("host", "")
             user = act.get("user", "root")
-            pwd = act.get("password", "")
             cmd = act.get("command", "")
             port = act.get("port", 22)
+            
+            # Если агент написал бред вместо IP, берем последний сохраненный хост
             if not host or len(host) < 7 or "." not in host:
-                if ssh_passwords: host = list(ssh_passwords.keys())[-1]
-                else: return "Укажи IP в SSH настройках слева"
-            if not pwd: pwd = ssh_passwords.get(host, "")
-            if not pwd: return f"Укажи пароль для {host}"
+                if ssh_passwords: 
+                    host = list(ssh_passwords.keys())[-1]
+                else: 
+                    return "⚠️ Укажи реальный IP в SSH настройках слева и нажми 'Сохранить SSH'"
+            
+            # ВСЕГДА используем пароль из настроек UI, игнорируя галлюцинации агента
+            pwd = ssh_passwords.get(host, "")
+            if not pwd: 
+                return f"⚠️ Пароль для {host} не сохранен. Введи его в поле 'Пароль' слева и нажми 'Сохранить SSH'."
+            
             out, code = ssh_cmd(host, cmd, user, pwd, port)
             return f"SSH {host}: {cmd}\n{out}"
         elif a == "install":
@@ -215,7 +222,7 @@ HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport"
 <button class="btn warn" onclick="runDiskCheck('smart_full')">🔍 SMART полный</button>
 <button class="btn warn" onclick="runDiskCheck('errors')">⚠️ Ошибки ядра</button>
 <button class="btn warn" onclick="runDiskCheck('fsck_readonly')">🔧 fsck (read-only)</button>
-<button class="btn warn" onclick="runDiskCheck('speed_read')">⚡ Скорость чтения</button>
+<button class="btn warn" onclick="runDiskCheck('speed_read')"> Скорость чтения</button>
 <button class="btn warn" onclick="runDiskCheck('logs')">📋 Системные логи</button>
 <button class="btn warn" onclick="runDiskCheck('memory')">💾 Память и swap</button>
 <div id="disk-result" class="disk-panel" style="display:none"></div>
@@ -265,7 +272,7 @@ function addMsg(text,type){const m=document.getElementById('messages'),d=documen
 async function newConv(){if(!confirm('Новый диалог?'))return;const r=await fetch('/new_conversation',{method:'POST'});const d=await r.json();
     session=d.session_id;document.getElementById('messages').innerHTML='';addMsg('Новый диалог.','agent');}
 async function quick(t){document.getElementById('input').value=t;sendMessage();}
-function saveSSH(){ssh={host:document.getElementById('ssh-host').value,user:document.getElementById('ssh-user').value,password:document.getElementById('ssh-password').value};alert('SSH: '+ssh.host);}
+function saveSSH(){ssh={host:document.getElementById('ssh-host').value,user:document.getElementById('ssh-user').value,password:document.getElementById('ssh-password').value};alert('SSH сохранен: '+ssh.host);}
 async function stopTask(){if(!confirm('Остановить?'))return;try{await fetch('/stop',{method:'POST'});}catch(e){}
     isStreaming=false;document.getElementById('send-btn').disabled=false;document.getElementById('stop-btn').style.display='none';
     document.getElementById('status').textContent='Остановлено';addMsg('Остановлено.','agent');}
