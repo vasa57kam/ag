@@ -1,679 +1,546 @@
-import json, time, subprocess, os, re, sqlite3, shutil, threading, urllib.request
-from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context
-from openai import OpenAI
+#!/usr/bin/env python3
+# AI Agent v5.0 — автономный агент с веб-интерфейсом
+import json, os, re, time, sqlite3, shutil, subprocess, hashlib, secrets
+import urllib.request
+from flask import Flask, request, jsonify, Response, render_template_string
 import paramiko
 
+BASE = "/opt/ai-agent"
+WORKSPACE = BASE + "/workspace"
+DB = BASE + "/agent.db"
+CFG_PATH = BASE + "/config.json"
+OLLAMA = "http://127.0.0.1:11434"
+MAX_STEPS = 8
+
+os.makedirs(WORKSPACE, exist_ok=True)
 app = Flask(__name__)
 
-# === КОНФИГУРАЦИЯ ===
-CONFIG_PATH = "/opt/ai-agent/config.json"
-WORKSPACE = "/opt/ai-agent/workspace"
-DB_PATH = "/opt/ai-agent/agent.db"
+# ---------- КОНФИГ ----------
+def load_cfg():
+    cfg = {}
+    if os.path.exists(CFG_PATH):
+        try: cfg = json.load(open(CFG_PATH))
+        except Exception: cfg = {}
+    cfg.setdefault("model", "qwen2.5-coder:14b")
+    cfg.setdefault("num_ctx", 8192)
+    cfg.setdefault("ssh", {})
+    cfg.setdefault("default_host", "")
+    cfg.setdefault("web_password", "")
+    return cfg
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    return {"model": "qwen2.5-coder:14b", "ssh_host": "192.168.0.33", "ssh_user": "root"}
+def save_cfg():
+    with open(CFG_PATH, "w") as f: json.dump(CFG, f, indent=2)
+    try: os.chmod(CFG_PATH, 0o600)
+    except Exception: pass
 
-def save_config(cfg):
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump(cfg, f)
+CFG = load_cfg()
+if not CFG["web_password"]:
+    CFG["web_password"] = secrets.token_urlsafe(6)
+    save_cfg()
+AUTH_TOKEN = hashlib.sha256(CFG["web_password"].encode()).hexdigest()
 
-CONFIG = load_config()
-MODEL = CONFIG.get("model", "qwen2.5-coder:14b")
+STOP = set()
 
-AVAILABLE_MODELS = ["qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen2.5-coder:32b", "qwen2.5-coder:32b-q3_K_M"]
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-ssh_passwords = {}
-STOP_FLAG = False
+# ---------- БАЗА ----------
+def db():
+    c = sqlite3.connect(DB)
+    c.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, sid TEXT, role TEXT, content TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT, sid TEXT, status TEXT, info TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    return c
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS messages 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS tasks 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, status TEXT, action TEXT, progress TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    return conn
+def save_msg(sid, role, content):
+    with db() as c: c.execute("INSERT INTO messages(sid,role,content) VALUES(?,?,?)", (sid, role, content))
 
-def get_history(session_id, limit=30):
-    conn = init_db()
-    cursor = conn.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit))
-    msgs = cursor.fetchall()
-    msgs.reverse()
-    return [{"role": "system", "content": """Ты — автономный ИИ-агент. Ты выполняешь действия через JSON.
+def set_task(sid, status, info=""):
+    with db() as c: c.execute("INSERT INTO tasks(sid,status,info) VALUES(?,?,?)", (sid, status, info[:300]))
 
+SYSTEM = """Ты — автономный инженер-агент на Linux-сервере. Ты САМ выполняешь задачи: файлы, команды, пакеты, SSH, git.
+Отвечай СТРОГО одним JSON-объектом на шаг, без markdown и пояснений.
+Форматы действий:
+{"action":"exec","command":"..."}
+{"action":"read","path":"..."}
+{"action":"write","path":"...","content":"..."}
+{"action":"ssh","command":"..."}
+{"action":"install","package":"..."}
+{"action":"git","command":"status|commit|push|pull","message":"..."}
+{"action":"disk","type":"info|smart|errors|memory|fsck|speed"}
+{"action":"reply","text":"..."}
+{"action":"done","result":"..."}
 ПРАВИЛА:
-1. Отвечай ТОЛЬКО одним JSON-объектом, без текста до или после.
-2. Никаких markdown, никаких пояснений.
-3. После получения результата действия — продолжай работу.
-4. Для SSH НЕ указывай password в JSON — сервер сам подставит сохранённый пароль.
+- Один шаг = один JSON. Получил результат — делай следующий шаг.
+- SSH: хост, логин и пароль УЖЕ хранит система. НЕ указывай их в JSON и НИКОГДА не отказывайся от SSH-задач. Фразы "не могу запомнить пароль" запрещены.
+- Не выдумывай вывод команд — жди реальный результат.
+- Ошибка? Исправь и повтори (до 3 раз), потом reply с объяснением.
+- Рабочая папка: /opt/ai-agent/workspace.
+"""
 
-ДОСТУПНЫЕ ДЕЙСТВИЯ (выбирай одно):
-{"action":"exec","command":"команда"}
-{"action":"ssh","command":"команда"}
-{"action":"write","path":"/путь","content":"код"}
-{"action":"read","path":"/путь"}
-{"action":"install","package":"пакет"}
-{"action":"git","command":"commit","message":"msg"}
-{"action":"disk_check","type":"smart"}
-{"action":"self_improve","code":"новый код"}
-{"action":"reply","text":"ответ пользователю"}
-{"action":"done","result":"итог"}
+def build_history(sid):
+    with db() as c:
+        rows = c.execute("SELECT role,content FROM messages WHERE sid=? ORDER BY id DESC LIMIT 14", (sid,)).fetchall()
+    rows.reverse()
+    msgs = [{"role": "system", "content": SYSTEM}]
+    for r, t in rows:
+        msgs.append({"role": r, "content": t[:3500]})
+    return msgs
 
-Пример правильного ответа: {"action":"exec","command":"ls -la"}
-"""}] + [{"role": m[0], "content": m[1]} for m in msgs]
+# ---------- OLLAMA (нативный API, реальные метрики) ----------
+def ollama_stream(path, payload, timeout=600):
+    req = urllib.request.Request(OLLAMA + path, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for line in r:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
 
-def save_msg(session_id, role, content):
-    conn = init_db()
-    conn.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", (session_id, role, content))
-    conn.commit()
+def ollama_get(path):
+    with urllib.request.urlopen(OLLAMA + path, timeout=10) as r:
+        return json.loads(r.read().decode())
 
-def save_task(session_id, status, action, progress=""):
-    conn = init_db()
-    conn.execute("INSERT INTO tasks (session_id, status, action, progress) VALUES (?, ?, ?, ?)", 
-                 (session_id, status, action, progress))
-    conn.commit()
+def installed_models():
+    try: return [m["name"] for m in ollama_get("/api/tags").get("models", [])]
+    except Exception: return []
 
-def get_last_task(session_id):
-    conn = init_db()
-    cursor = conn.execute("SELECT status, action, progress FROM tasks WHERE session_id=? ORDER BY id DESC LIMIT 1", (session_id,))
-    return cursor.fetchone()
+def ensure_model():
+    models = installed_models()
+    if not models: return
+    if CFG["model"] not in models:
+        for pref in ("qwen2.5-coder:14b", "qwen2.5-coder:7b", "qwen2.5-coder:32b"):
+            if pref in models:
+                CFG["model"] = pref; save_cfg(); return
+        CFG["model"] = models[0]; save_cfg()
 
-def run_cmd(cmd, timeout=60):
+# ---------- ПАРСЕР ДЕЙСТВИЙ (понимает несколько JSON) ----------
+def parse_actions(text):
+    t = re.sub(r"```(?:json)?", "", text).strip()
+    dec = json.JSONDecoder()
+    acts, i = [], 0
+    while i < len(t):
+        j = t.find("{", i)
+        if j < 0: break
+        try:
+            obj, end = dec.raw_decode(t, j)
+            if isinstance(obj, dict) and "action" in obj: acts.append(obj)
+            i = end
+        except ValueError:
+            i = j + 1
+    return acts
+
+# ---------- ИНСТРУМЕНТЫ ----------
+def sh(cmd, timeout=120):
     try:
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=WORKSPACE)
-        out = res.stdout
-        if res.stderr: out += "\n[STDERR]: " + res.stderr
-        return out, res.returncode
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=WORKSPACE)
+        out = r.stdout + (("\n[stderr] " + r.stderr) if r.stderr else "")
+        return out, r.returncode
+    except subprocess.TimeoutExpired: return "Таймаут команды", -1
     except Exception as e: return str(e), -1
 
-def ssh_cmd(host, cmd, user, pwd, port=22):
-    if STOP_FLAG: return "Остановлено", -1
-    if not host or len(host) < 7 or "." not in host:
-        return f"Неверный хост '{host}'. Укажи IP в настройках.", -1
+def ssh_creds(host):
+    h = host if host in CFG["ssh"] else CFG.get("default_host", "")
+    return h, CFG["ssh"].get(h, {})
+
+def ssh_run(host, cmd):
+    h, cr = ssh_creds(host)
+    if not h or not cr.get("password"):
+        return "SSH не настроен: введи хост/пароль слева и нажми 'Сохранить SSH'", -1
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(host, port=port, username=user, password=pwd, timeout=10, allow_agent=False, look_for_keys=False)
-        out, err = ssh.exec_command(cmd, timeout=20)
-        res = out.read().decode('utf-8', errors='replace')
-        e = err.read().decode('utf-8', errors='replace')
-        if e: res += "\n[STDERR]: " + e
-        ssh.close()
-        return res, 0
-    except Exception as ex: return f"SSH ошибка: {ex}", -1
+        s = paramiko.SSHClient()
+        s.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        s.connect(h, port=int(cr.get("port", 22)), username=cr.get("user", "root"),
+                  password=cr["password"], timeout=10, allow_agent=False, look_for_keys=False)
+        _, out, err = s.exec_command(cmd, timeout=30)
+        res = out.read().decode("utf-8", "replace")
+        e = err.read().decode("utf-8", "replace")
+        s.close()
+        return (res + (("\n[stderr] " + e) if e else "")), 0
+    except Exception as ex:
+        return f"SSH ошибка ({h}): {ex}", -1
 
-def disk_check(check_type):
+def root_dev():
+    out, _ = sh("findmnt -no SOURCE /")
+    return out.strip() or "/dev/sda2"
+
+def disk_check(t):
+    dev = root_dev()
+    disk = re.sub(r"\d+$", "", dev) or "/dev/sda"
     checks = {
-        "info": "df -h && echo '---INODE---' && df -i && echo '---MOUNT---' && mount | grep -E '^/dev'",
-        "smart": "smartctl -H /dev/sda 2>&1 && echo '===ATTRIBUTES===' && smartctl -A /dev/sda 2>&1",
-        "smart_full": "smartctl -a /dev/sda 2>&1",
-        "errors": "dmesg | grep -iE 'error|fail|bad|corrupt|ext4.*error|xfs.*error' | tail -50",
-        "fsck_readonly": "fsck -n /dev/sda2 2>&1 | head -100",
-        "speed_read": "hdparm -t /dev/sda 2>&1",
-        "logs": "journalctl -p err -b --no-pager | tail -50",
-        "memory": "free -h && echo '---SWAP---' && swapon --show && echo '---VMSTAT---' && vmstat 1 3"
+        "info": "df -h && df -i",
+        "smart": f"smartctl -H {disk} 2>&1; smartctl -A {disk} 2>&1 | head -30",
+        "errors": "dmesg | grep -iE 'error|fail|bad|corrupt' | tail -40",
+        "memory": "free -h && swapon --show",
+        "fsck": f"fsck -n {dev} 2>&1 | head -60",
+        "speed": f"hdparm -t {disk} 2>&1",
     }
-    if check_type not in checks:
-        return f"Неизвестный тип: {check_type}. Доступны: {', '.join(checks.keys())}"
-    cmd = checks[check_type]
-    out, code = run_cmd(cmd, timeout=120)
-    return f"=== Проверка: {check_type} ===\n{out}"
+    if t not in checks: return "Типы: " + ", ".join(checks)
+    out, _ = sh(checks[t], 120)
+    return f"=== {t} ===\n{out}"
 
-def self_improve(new_code):
-    backup = f"/opt/ai-agent/agent.py.bak.{int(time.time())}"
-    shutil.copy2("/opt/ai-agent/agent.py", backup)
-    with open("/opt/ai-agent/agent.py", 'w', encoding='utf-8') as f:
-        f.write(new_code)
-    return f"Код обновлён. Бэкап: {backup}. Выполни: systemctl restart ai-agent"
+def self_improve(code):
+    try: compile(code, "agent.py", "exec")
+    except SyntaxError as e: return f"Отклонено: синтаксическая ошибка: {e}"
+    bak = f"{BASE}/agent.py.bak.{int(time.time())}"
+    shutil.copy2(f"{BASE}/agent.py", bak)
+    with open(f"{BASE}/agent.py", "w") as f: f.write(code)
+    return f"Код обновлён (бэкап {bak}). Нажми 'Перезапустить агента'."
 
-def handle_action(act):
-    global STOP_FLAG
-    if STOP_FLAG: return "Остановлено пользователем"
+def handle(act):
     a = act.get("action", "")
     try:
         if a == "exec":
-            out, code = run_cmd(act.get("command", ""))
-            return f"{'OK' if code==0 else 'ERR'}: {act['command']}\n{out}"
-        elif a == "write":
+            out, code = sh(act.get("command", ""))
+            return f"[{'ok' if code == 0 else 'err'}] {act.get('command')}\n{out}"
+        if a == "read":
             p = act.get("path", "")
-            os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
-            with open(p, 'w', encoding='utf-8') as f: f.write(act.get("content", ""))
-            return f"Записан: {p} ({len(act.get('content',''))} байт)"
-        elif a == "read":
+            return open(p, encoding="utf-8", errors="replace").read()[:6000]
+        if a == "write":
             p = act.get("path", "")
-            try:
-                with open(p, 'r', encoding='utf-8') as f: return f.read()
-            except Exception as e: return f"Ошибка чтения: {e}"
-        elif a == "ssh":
-            # Берём хост из настроек если агент написал бред
-            host = act.get("host", "")
-            user = act.get("user", "root")
-            cmd = act.get("command", "")
-            port = act.get("port", 22)
-            
-            if not host or len(host) < 7 or "." not in host:
-                if ssh_passwords: 
-                    host = list(ssh_passwords.keys())[-1]
-                else: 
-                    return "⚠️ Укажи реальный IP в SSH настройках слева и нажми 'Сохранить SSH'"
-            
-            # ВСЕГДА берём пароль из настроек UI, игнорируя то что написал агент
-            pwd = ssh_passwords.get(host, "")
-            if not pwd: 
-                return f"⚠️ Пароль для {host} не сохранён. Введи его в поле 'Пароль' слева и нажми 'Сохранить SSH'."
-            
-            out, code = ssh_cmd(host, cmd, user, pwd, port)
-            return f"SSH {host}: {cmd}\n{out}"
-        elif a == "install":
-            out, code = run_cmd(f"apt update && apt install -y {act.get('package','')}", 180)
-            return f"Установка {act.get('package')}:\n{out}"
-        elif a == "git":
-            os.chdir(WORKSPACE)
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            open(p, "w", encoding="utf-8").write(act.get("content", ""))
+            return f"Записан {p}"
+        if a == "ssh":
+            out, code = ssh_run(act.get("host", ""), act.get("command", ""))
+            return f"[{'ok' if code == 0 else 'err'}] ssh\n{out}"
+        if a == "install":
+            out, _ = sh(f"apt-get install -y {act.get('package','')}", 300)
+            return out
+        if a == "git":
             c = act.get("command", "status")
             if c == "commit":
-                run_cmd("git add -A")
-                out, _ = run_cmd(f'git commit -m "{act.get("message","ai")}"')
+                sh("git add -A")
+                out, _ = sh(f'git commit -m "{act.get("message","agent")}"')
                 return out
-            out, _ = run_cmd(f"git {c}")
+            out, _ = sh(f"git {c}")
             return out
-        elif a == "disk_check":
-            return disk_check(act.get("type", "info"))
-        elif a == "self_improve":
-            return self_improve(act.get("code", ""))
-        elif a == "reply":
-            return act.get("text", "")
-        elif a == "done":
-            return f"ГОТОВО: {act.get('result','')}"
-        else:
-            return f"Неизвестное действие: {a}"
+        if a == "disk": return disk_check(act.get("type", "info"))
+        if a == "self_improve": return self_improve(act.get("code", ""))
+        return f"Неизвестное действие {a}"
     except Exception as e:
-        return f"Ошибка: {e}"
+        return f"Ошибка выполнения: {e}"
 
-def extract_json(text):
-    text = re.sub(r'^```json\s*|\s*```$', '', text).strip()
-    start, end = text.find('{'), text.rfind('}') + 1
-    if start != -1 and end > start:
-        try: return json.loads(text[start:end])
-        except: pass
-    for line in text.split('\n'):
-        line = line.strip()
-        if line.startswith('{') and line.endswith('}'):
-            try: return json.loads(line)
-            except: pass
-    return None
+def sse(d): return f"data: {json.dumps(d, ensure_ascii=False)}\n\n"
 
-HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Agent v4.2</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;flex-direction:column}
-.header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
-.header h1{color:#58a6ff;font-size:18px}.stats{display:flex;gap:15px;font-size:12px}
-.stat{background:#21262d;padding:4px 10px;border-radius:5px;border:1px solid #30363d}.stat-label{color:#8b949e}.stat-value{color:#58a6ff;font-weight:bold}.speed{color:#3fb950}
-.container{flex:1;display:flex;overflow:hidden}.sidebar{width:280px;background:#161b22;border-right:1px solid #30363d;padding:12px;overflow-y:auto}
-.sidebar h3{color:#8b949e;font-size:11px;text-transform:uppercase;margin:12px 0 8px;letter-spacing:1px}.btn{width:100%;padding:8px;margin-bottom:6px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;cursor:pointer;font-size:12px;text-align:left}
-.btn:hover{background:#30363d;border-color:#58a6ff}.btn.primary{background:#238636;border-color:#2ea043;color:#fff;font-weight:bold}.btn.danger{background:#da3633;border-color:#f85149}.btn.warn{background:#f0883e;border-color:#d29922;color:#fff}.btn.info{background:#1f6feb;border-color:#388bfd;color:#fff}
-.input-group{margin-bottom:8px}.input-group label{display:block;font-size:10px;color:#8b949e;margin-bottom:3px}
-.input-group input,.input-group select{width:100%;padding:6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:11px}
-.chat-area{flex:1;display:flex;flex-direction:column;overflow:hidden}.messages{flex:1;overflow-y:auto;padding:15px}
-.message{margin-bottom:15px;max-width:85%;animation:fadeIn .3s}@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-.message.user{margin-left:auto}.message-header{font-size:11px;color:#8b949e;margin-bottom:4px}
-.message-content{padding:10px 14px;border-radius:10px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word;font-size:13px}
-.message.user .message-content{background:#1f6feb;color:#fff;border-bottom-right-radius:3px}
-.message.agent .message-content{background:#21262d;border:1px solid #30363d;border-bottom-left-radius:3px}
-.message.agent.thinking .message-content{background:#1c2128;border-style:dashed;color:#8b949e;font-style:italic}
-.message.agent.action .message-content{background:#1a1f2e;border:1px solid #1f6feb;color:#79c0ff;font-family:monospace;font-size:12px}
-.input-area{background:#161b22;border-top:1px solid #30363d;padding:12px 15px;display:flex;gap:8px}
-.input-area textarea{flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:10px;border-radius:6px;font-size:13px;font-family:inherit;resize:none;min-height:40px}
-.input-area textarea:focus{outline:none;border-color:#58a6ff}.input-area button{padding:10px 18px;background:#238636;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold}
-.input-area button:disabled{background:#21262d;cursor:not-allowed}
-.streaming-indicator{display:inline-block;width:6px;height:6px;background:#3fb950;border-radius:50%;margin-left:6px;animation:pulse 1s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}.action-badge{display:inline-block;padding:2px 6px;background:#1f6feb;color:#fff;border-radius:3px;font-size:10px;margin-left:6px}
-.result-block{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:8px;font-family:monospace;font-size:11px;white-space:pre-wrap;max-height:300px;overflow-y:auto;color:#7ee787}
-.disk-panel{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:8px;max-height:400px;overflow-y:auto;font-family:monospace;font-size:11px;white-space:pre-wrap;color:#7ee787}
-.disk-panel.running{color:#f0883e;border-color:#f0883e}.disk-panel.error{color:#f85149;border-color:#f85149}
-.model-select-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:12px}
-.model-select-box select{width:100%;padding:8px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;margin-bottom:8px}
-.model-list{max-height:300px;overflow-y:auto}
-.model-item{display:flex;justify-content:space-between;align-items:center;padding:8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;margin-bottom:6px}
-.model-item .info{flex:1;overflow:hidden}.model-item .name{color:#58a6ff;font-weight:bold;font-size:12px;margin-bottom:2px}.model-item .size{color:#8b949e;font-size:10px}
-.model-item button{padding:4px 8px;font-size:10px;border:none;border-radius:3px;cursor:pointer;margin-left:4px}
-.model-item .use-btn{background:#238636;color:#fff}.model-item .rm-btn{background:#da3633;color:#fff}
-.download-section{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:12px}
-.popular-models{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
-.popular-models .btn{padding:6px;font-size:10px;margin-bottom:0}
-::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0d1117}::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+# ---------- ЦИКЛ АГЕНТА ----------
+def run_agent(sid):
+    set_task(sid, "running")
+    steps = 0
+    while steps < MAX_STEPS and sid not in STOP:
+        full, metrics = "", {}
+        try:
+            for ch in ollama_stream("/api/chat", {"model": CFG["model"], "messages": build_history(sid),
+                                                  "stream": True,
+                                                  "options": {"num_ctx": CFG["num_ctx"], "temperature": 0.2}}):
+                if sid in STOP: break
+                c = ch.get("message", {}).get("content", "")
+                if c:
+                    full += c
+                    yield sse({"type": "token", "content": c})
+                if ch.get("done"):
+                    ec, ed = ch.get("eval_count", 0), ch.get("eval_duration", 1)
+                    metrics = {"speed": round(ec / (ed / 1e9), 1) if ed else 0,
+                               "used": ch.get("prompt_eval_count", 0) + ec,
+                               "limit": CFG["num_ctx"]}
+                    yield sse({"type": "metrics", **metrics})
+        except Exception as e:
+            yield sse({"type": "error", "text": str(e)}); return
+        if sid in STOP:
+            save_msg(sid, "assistant", full + " [остановлено]")
+            set_task(sid, "stopped"); yield sse({"type": "stopped"}); return
+        save_msg(sid, "assistant", full)
+        acts = parse_actions(full)
+        if not acts:
+            yield sse({"type": "reply", "text": full})
+            set_task(sid, "done", "reply"); return
+        terminal = False
+        for act in acts:
+            a = act.get("action")
+            if a in ("reply", "done"):
+                txt = act.get("text") or ("✅ " + act.get("result", "Готово"))
+                yield sse({"type": "reply", "text": txt})
+                terminal = True; break
+            yield sse({"type": "action", "action": a, "args": act})
+            res = handle(act)
+            yield sse({"type": "result", "text": res[:4000]})
+            save_msg(sid, "user", f"[результат {a}]\n{res[:3000]}")
+        if terminal:
+            set_task(sid, "done"); return
+        steps += 1
+    set_task(sid, "done", "limit")
+    yield sse({"type": "reply", "text": "Лимит шагов исчерпан. Уточни задачу."})
+
+# ---------- АВТОРИЗАЦИЯ ----------
+@app.before_request
+def auth():
+    if not CFG["web_password"]: return
+    if request.path in ("/", "/login"): return
+    if request.cookies.get("tok") != AUTH_TOKEN:
+        return jsonify({"error": "auth"}), 401
+
+@app.route("/login", methods=["POST"])
+def login():
+    if request.json.get("password") == CFG["web_password"]:
+        r = make_response(jsonify({"ok": True}))
+        r.set_cookie("tok", AUTH_TOKEN, httponly=True, max_age=86400 * 30)
+        return r
+    return jsonify({"ok": False}), 403
+
+# ---------- МАРШРУТЫ ----------
+@app.route("/")
+def home():
+    boot = {"model": CFG["model"], "sid": str(int(time.time())), "num_ctx": CFG["num_ctx"],
+            "default_host": CFG.get("default_host", ""), "auth": bool(CFG["web_password"]),
+            "ssh": {h: {"user": c.get("user", "root"), "port": c.get("port", 22)} for h, c in CFG["ssh"].items()}}
+    return render_template_string(HTML, boot=json.dumps(boot, ensure_ascii=False))
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    d = request.json
+    sid = d.get("sid", str(int(time.time())))
+    STOP.discard(sid)
+    save_msg(sid, "user", d.get("message", ""))
+    return Response(run_agent(sid), mimetype="text/event-stream")
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    STOP.add(request.json.get("sid", "")); return jsonify({"ok": True})
+
+@app.route("/models")
+def models():
+    ms = []
+    try: ms = [{"name": m["name"], "size": round(m.get("size", 0) / 1e9, 1)} for m in ollama_get("/api/tags")["models"]]
+    except Exception: pass
+    return jsonify({"models": ms, "current": CFG["model"]})
+
+@app.route("/model/switch", methods=["POST"])
+def switch():
+    name = request.json.get("name", "")
+    if name not in installed_models(): return jsonify({"ok": False, "msg": "Модель не установлена"})
+    old = CFG["model"]
+    CFG["model"] = name; save_cfg()
+    try:
+        urllib.request.urlopen(urllib.request.Request(OLLAMA + "/api/generate",
+            data=json.dumps({"model": old, "keep_alive": 0}).encode(),
+            headers={"Content-Type": "application/json"}), timeout=30)
+    except Exception: pass
+    return jsonify({"ok": True, "msg": f"{old} → {name}", "model": name})
+
+@app.route("/model/pull", methods=["POST"])
+def pull():
+    name = request.json.get("name", "")
+    def gen():
+        try:
+            for ch in ollama_stream("/api/pull", {"name": name, "stream": True}, timeout=3600):
+                done, total = ch.get("completed", 0), ch.get("total", 0)
+                pct = round(done * 100 / total) if total else 0
+                yield sse({"status": ch.get("status", ""), "pct": pct})
+            yield sse({"status": "done", "pct": 100})
+        except Exception as e:
+            yield sse({"status": "error: " + str(e), "pct": 0})
+    return Response(gen(), mimetype="text/event-stream")
+
+@app.route("/model/delete", methods=["POST"])
+def delete():
+    name = request.json.get("name", "")
+    try:
+        urllib.request.urlopen(urllib.request.Request(OLLAMA + "/api/delete",
+            data=json.dumps({"name": name}).encode(),
+            headers={"Content-Type": "application/json"}, method="DELETE"), timeout=30)
+        return jsonify({"ok": True, "msg": f"{name} удалена"})
+    except Exception as e: return jsonify({"ok": False, "msg": str(e)})
+
+@app.route("/ssh/save", methods=["POST"])
+def ssh_save():
+    d = request.json
+    h = d.get("host", "").strip()
+    if not h: return jsonify({"ok": False, "msg": "Пустой хост"})
+    CFG["ssh"][h] = {"user": d.get("user", "root"), "password": d.get("password", ""), "port": d.get("port", 22)}
+    CFG["default_host"] = h; save_cfg()
+    return jsonify({"ok": True, "msg": f"SSH сохранён: {h}"})
+
+@app.route("/ssh/test", methods=["POST"])
+def ssh_test():
+    out, code = ssh_run("", "uptime && uname -a")
+    return jsonify({"ok": code == 0, "msg": out})
+
+@app.route("/disk")
+def disk():
+    return jsonify({"result": disk_check(request.args.get("type", "info"))})
+
+@app.route("/sessions")
+def sessions():
+    with db() as c:
+        rows = c.execute("SELECT sid, MAX(ts) t, COUNT(*) n FROM messages GROUP BY sid ORDER BY t DESC LIMIT 20").fetchall()
+    return jsonify({"sessions": [{"sid": r[0], "ts": r[1], "n": r[2]} for r in rows]})
+
+@app.route("/session")
+def session():
+    sid = request.args.get("sid", "")
+    with db() as c:
+        rows = c.execute("SELECT role,content FROM messages WHERE sid=? ORDER BY id", (sid,)).fetchall()
+        task = c.execute("SELECT status,info FROM tasks WHERE sid=? ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+    return jsonify({"history": [{"role": r[0], "content": r[1]} for r in rows],
+                    "task": {"status": task[0], "info": task[1]} if task else None})
+
+@app.route("/restart", methods=["POST"])
+def restart():
+    subprocess.Popen("sleep 1; systemctl restart ai-agent", shell=True)
+    return jsonify({"ok": True})
+
+# ---------- ВЕБ-ИНТЕРФЕЙС ----------
+HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Agent v5</title><style>
+*{box-sizing:border-box;margin:0}body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;flex-direction:column}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+header h1{font-size:16px;color:#58a6ff}.st{background:#21262d;border:1px solid #30363d;border-radius:6px;padding:3px 10px;font-size:12px}
+.st b{color:#3fb950}.ctx{width:120px;height:6px;background:#21262d;border-radius:3px;overflow:hidden}.ctx i{display:block;height:100%;background:#d2a8ff;width:0}
+main{flex:1;display:flex;overflow:hidden}aside{width:280px;background:#161b22;border-right:1px solid #30363d;padding:12px;overflow-y:auto}
+aside h3{font-size:11px;color:#8b949e;text-transform:uppercase;margin:12px 0 6px}
+button{width:100%;padding:7px;margin-bottom:5px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;cursor:pointer;font-size:12px;text-align:left}
+button:hover{border-color:#58a6ff}button.g{background:#238636;color:#fff}button.r{background:#da3633;color:#fff}button.b{background:#1f6feb;color:#fff}button.o{background:#9e6a03;color:#fff}
+input,select{width:100%;padding:6px;margin-bottom:5px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;font-size:12px}
+#chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:85%;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
+.u{align-self:flex-end;background:#1f6feb;color:#fff}.a{align-self:flex-start;background:#21262d;border:1px solid #30363d}
+.turn{align-self:flex-start;max-width:90%;width:100%}.think{color:#8b949e;font-size:12px;white-space:pre-wrap;margin:4px 0}
+.card{background:#161b22;border:1px solid #1f6feb;border-radius:8px;margin:6px 0;overflow:hidden}
+.card .h{padding:6px 10px;font-size:11px;color:#79c0ff;background:#1a1f2e}.card pre{padding:8px 10px;font-size:11px;overflow-x:auto;max-height:260px;overflow-y:auto;color:#7ee787}
+footer{background:#161b22;border-top:1px solid #30363d;padding:10px;display:flex;gap:8px}
+footer textarea{flex:1;resize:none;min-height:44px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:8px;padding:10px;font-size:13px}
+footer button{width:auto;padding:10px 20px}
+#login{position:fixed;inset:0;background:#0d1117;display:none;align-items:center;justify-content:center;z-index:9}
+#login div{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;width:300px}
+.mi{display:flex;align-items:center;gap:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px;margin-bottom:5px;font-size:11px}
+.mi span{flex:1;overflow:hidden;text-overflow:ellipsis}.mi button{width:auto;margin:0;padding:3px 8px;font-size:10px}
+#pull{font-size:11px;color:#58a6ff;margin:4px 0}
 </style></head><body>
-<div class="header"><h1>AI Agent (<span id="current-model">{{ model }}</span>)</h1>
-<div class="stats"><div class="stat"><span class="stat-label">Скорость: </span><span class="stat-value speed" id="speed">0</span> <span class="stat-label">ток/с</span></div>
-<div class="stat"><span class="stat-label">Статус: </span><span class="stat-value" id="status">Готов</span></div></div></div>
-<div class="container"><div class="sidebar">
-<h3>📦 Управление моделями</h3>
-<div class="model-select-box">
-<label style="font-size:10px;color:#8b949e;display:block;margin-bottom:4px">Выбрать модель:</label>
-<select id="model-select" onchange="switchModel(this.value)"></select>
-</div>
-<div class="download-section">
-<label style="font-size:10px;color:#8b949e;display:block;margin-bottom:4px">Скачать новую:</label>
-<input type="text" id="new-model-name" placeholder="qwen2.5-coder:14b" style="width:100%;padding:6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:11px;margin-bottom:6px">
-<button class="btn info" onclick="downloadModel()">⬇️ Скачать</button>
-<div style="margin-top:8px;font-size:10px;color:#8b949e">Популярные:</div>
-<div class="popular-models">
-<button class="btn" onclick="downloadModelByName('qwen2.5-coder:7b')">Qwen 7B</button>
-<button class="btn" onclick="downloadModelByName('qwen2.5-coder:14b')">Qwen 14B</button>
-<button class="btn" onclick="downloadModelByName('qwen2.5-coder:32b')">Qwen 32B</button>
-<button class="btn" onclick="downloadModelByName('qwen2.5-coder:32b-q3_K_M')">Qwen 32B Q3</button>
-<button class="btn" onclick="downloadModelByName('llama3.1:8b')">Llama 3.1 8B</button>
-<button class="btn" onclick="downloadModelByName('mistral:7b')">Mistral 7B</button>
-</div>
-</div>
-<div id="download-status"></div>
-<div id="models-list" class="model-list"></div>
-<h3>🔐 SSH</h3>
-<div class="input-group"><label>Хост IP</label><input type="text" id="ssh-host" value="{{ ssh_host }}"></div>
-<div class="input-group"><label>Пользователь</label><input type="text" id="ssh-user" value="{{ ssh_user }}"></div>
-<div class="input-group"><label>Пароль</label><input type="password" id="ssh-password"></div>
-<button class="btn" onclick="saveSSH()">💾 Сохранить SSH</button>
-<h3>⚡ Действия</h3>
-<button class="btn primary" onclick="newConv()">🆕 Новый диалог</button>
-<button class="btn danger" id="stop-btn" onclick="stopTask()" style="display:none">🛑 ОСТАНОВИТЬ</button>
-<button class="btn" onclick="quick('ls -la /opt/ai-agent/workspace')">📁 Файлы workspace</button>
-<button class="btn" onclick="quick('git status')">📊 Git статус</button>
-<button class="btn" onclick="quick('df -h && free -h')">💻 Система</button>
-<h3>🔍 Проверка диска</h3>
-<button class="btn warn" onclick="runDiskCheck('info')">📊 Информация</button>
-<button class="btn warn" onclick="runDiskCheck('smart')">❤️ SMART здоровье</button>
-<button class="btn warn" onclick="runDiskCheck('errors')">⚠️ Ошибки ядра</button>
-<button class="btn warn" onclick="runDiskCheck('memory')">💾 Память</button>
-<div id="disk-result" class="disk-panel" style="display:none"></div>
-<h3>📂 История сессий</h3>
-<button class="btn" onclick="loadLastSession()">📂 Последняя сессия</button>
-<div id="sessions-list" style="font-size:11px;color:#8b949e;margin-top:6px"></div>
-</div>
-<div class="chat-area"><div class="messages" id="messages"></div>
-<div class="input-area"><textarea id="input" placeholder="Задача... (Enter: отправить)" onkeydown="handleKey(event)"></textarea>
-<button id="send-btn" onclick="sendMessage()">Отправить</button></div></div></div>
+<div id="login"><div><h3 style="margin-bottom:10px">Вход</h3><input type="password" id="lp" placeholder="Пароль агента"><button class="g" onclick="doLogin()">Войти</button><div id="lerr" style="color:#f85149;font-size:11px;margin-top:6px"></div></div></div>
+<header><h1>🤖 AI Agent v5</h1><span class="st">Модель: <b id="hm">...</b></span><span class="st">Скорость: <b id="hs">0</b> ток/с</span><span class="st">Контекст: <span id="hc">0</span></span><div class="ctx"><i id="hb"></i></div><span class="st" id="hst">Готов</span></header>
+<main><aside>
+<h3>Модель</h3><select id="msel" onchange="switchModel(this.value)"></select>
+<div id="mlist"></div>
+<h3>Скачать модель</h3><input id="mname" placeholder="qwen2.5-coder:14b">
+<button class="b" onclick="pullModel()">⬇️ Скачать</button>
+<div style="display:flex;gap:4px;flex-wrap:wrap">
+<button style="width:auto" onclick="pullName('qwen2.5-coder:7b')">7B</button>
+<button style="width:auto" onclick="pullName('qwen2.5-coder:14b')">14B</button>
+<button style="width:auto" onclick="pullName('qwen2.5-coder:32b')">32B</button>
+<button style="width:auto" onclick="pullName('qwen2.5-coder:32b-q3_K_M')">32B-Q3</button>
+<button style="width:auto" onclick="pullName('llama3.1:8b')">Llama8B</button>
+<button style="width:auto" onclick="pullName('mistral-nemo:12b')">Nemo12B</button></div>
+<div id="pull"></div>
+<h3>SSH</h3><input id="sh" placeholder="Хост IP"><input id="su" placeholder="Пользователь" value="root"><input id="sp" type="number" placeholder="Порт" value="22"><input id="sw" type="password" placeholder="Пароль">
+<button onclick="sshSave()">💾 Сохранить SSH</button><button onclick="sshTest()">🔌 Проверить SSH</button>
+<h3>Действия</h3><button class="g" onclick="newChat()">🆕 Новый диалог</button>
+<button class="r" id="stopb" style="display:none" onclick="stopTask()">🛑 Остановить</button>
+<button onclick="quick('Покажи файлы в workspace')">📁 Файлы</button>
+<button onclick="quick('Проверь диск и память, скажи есть ли проблемы')">🩺 Диагностика</button>
+<button class="o" onclick="restartAgent()">♻️ Перезапустить агента</button>
+<h3>Проверка диска</h3>
+<button class="o" onclick="disk('info')">📊 Информация</button><button class="o" onclick="disk('smart')">❤️ SMART</button>
+<button class="o" onclick="disk('errors')">⚠️ Ошибки ядра</button><button class="o" onclick="disk('memory')">💾 Память</button>
+<button class="o" onclick="disk('fsck')">🔧 fsck (read-only)</button><button class="o" onclick="disk('speed')">⚡ Скорость</button>
+<div id="dres" class="card" style="display:none"><pre></pre></div>
+<h3>История</h3><div id="sess"></div>
+</aside>
+<div id="chat"></div></main>
+<footer><textarea id="inp" placeholder="Задача агенту... (Enter — отправить)" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea><button class="g" id="sendb" onclick="send()">Отправить</button></footer>
 <script>
-let session=localStorage.getItem('last_session')||'{{ session_id }}';
-let isStreaming=false;
-let ssh={host:'{{ ssh_host }}',user:'{{ ssh_user }}',password:''};
-
-function handleKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}}
-
-async function sendMessage(){
-    const input=document.getElementById('input'),btn=document.getElementById('send-btn'),stopBtn=document.getElementById('stop-btn'),text=input.value.trim();
-    if(!text||isStreaming)return;
-    isStreaming=true;btn.disabled=true;stopBtn.style.display='block';input.value='';
-    localStorage.setItem('last_session',session);
-    addMsg(text,'user');
-    const agentMsg=addMsg('Думает...','agent thinking'),contentDiv=agentMsg.querySelector('.message-content');
-    document.getElementById('status').innerHTML='<span class="streaming-indicator"></span> Думает';
-    let full='',start=Date.now(),tokens=0,lastAction=null;
-    try{
-        const res=await fetch('/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,session_id:session,ssh})});
-        const reader=res.body.getReader(),dec=new TextDecoder();
-        while(true){const{done,value}=await reader.read();if(done)break;
-            for(const line of dec.decode(value).split('\\n')){
-                if(line.startsWith('data: ')){const d=JSON.parse(line.slice(6));
-                    if(d.type==='token'){full+=d.content;contentDiv.textContent=full;tokens++;
-                        document.getElementById('speed').textContent=(tokens/((Date.now()-start)/1000)).toFixed(1);
-                        document.getElementById('messages').scrollTop=999999;
-                    }else if(d.type==='action'){
-                        lastAction=d.action;agentMsg.className='message agent action';
-                        contentDiv.innerHTML='<b>Действие:</b> '+d.action+'<br><code>'+full+'</code>';
-                    }else if(d.type==='result'){
-                        contentDiv.innerHTML='<b>Действие:</b> '+lastAction+'<br><code>'+full+'</code><div class="result-block">'+d.result+'</div>';
-                    }else if(d.type==='done'){document.getElementById('status').textContent='Готов';stopBtn.style.display='none';loadSessions();}
-                    else if(d.type==='error'){contentDiv.textContent='Ошибка: '+d.error;document.getElementById('status').textContent='Ошибка';stopBtn.style.display='none';}
-                    else if(d.type==='stopped'){contentDiv.textContent='Остановлено.';document.getElementById('status').textContent='Остановлено';stopBtn.style.display='none';}
-                }
-            }
+const BOOT = {{ boot|safe }};
+let sid = localStorage.getItem('sid') || BOOT.sid, busy = false;
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+async function api(url, opt) {
+  const r = await fetch(url, opt);
+  if (r.status === 401) { $('login').style.display = 'flex'; throw new Error('auth'); }
+  return r;
+}
+async function doLogin() {
+  const r = await fetch('/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: $('lp').value})});
+  if (r.ok) { $('login').style.display = 'none'; init(); } else $('lerr').textContent = 'Неверный пароль';
+}
+function bubble(text, cls) { const d = document.createElement('div'); d.className = 'msg ' + cls; d.textContent = text; $('chat').appendChild(d); scroll(); return d; }
+function scroll() { $('chat').scrollTop = 1e9; }
+function newTurn() { const t = document.createElement('div'); t.className = 'turn'; $('chat').appendChild(t); return t; }
+function thinkBlock(turn) { let t = turn.querySelector('.think:last-child'); if (!t || t.dataset.closed) { t = document.createElement('div'); t.className = 'think'; turn.appendChild(t); } return t; }
+async function send() {
+  const text = $('inp').value.trim(); if (!text || busy) return;
+  busy = true; $('sendb').disabled = true; $('stopb').style.display = 'block'; $('inp').value = '';
+  localStorage.setItem('sid', sid);
+  bubble(text, 'u');
+  const turn = newTurn(); let think = thinkBlock(turn);
+  $('hst').textContent = 'Думает...';
+  try {
+    const r = await api('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sid, message: text})});
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const {done, value} = await rd.read(); if (done) break;
+      buf += dec.decode(value, {stream:true});
+      const lines = buf.split('\\n'); buf = lines.pop();
+      for (const ln of lines) {
+        if (!ln.startsWith('data: ')) continue;
+        const d = JSON.parse(ln.slice(6));
+        if (d.type === 'token') { think.dataset.closed = ''; think.textContent += d.content; scroll(); }
+        else if (d.type === 'action') {
+          think.dataset.closed = '1';
+          const c = document.createElement('div'); c.className = 'card';
+          c.innerHTML = '<div class="h">⚙️ ' + esc(d.action) + '</div><pre>' + esc(JSON.stringify(d.args, null, 1)) + '</pre>';
+          turn.appendChild(c); think = thinkBlock(turn); scroll();
         }
-    }catch(e){contentDiv.textContent='Ошибка: '+e;document.getElementById('status').textContent='Ошибка';stopBtn.style.display='none';}
-    isStreaming=false;btn.disabled=false;
-    if(document.getElementById('status').textContent==='Думает')document.getElementById('status').textContent='Готов';
-}
-
-function addMsg(text,type){
-    const m=document.getElementById('messages'),d=document.createElement('div');d.className='message '+type;
-    d.innerHTML='<div class="message-header">'+(type==='user'?'Ты':'Агент')+'</div><div class="message-content">'+text+'</div>';
-    m.appendChild(d);m.scrollTop=999999;return d;
-}
-
-async function newConv(){
-    if(!confirm('Новый диалог?'))return;
-    const r=await fetch('/new_conversation',{method:'POST'});const d=await r.json();
-    session=d.session_id;localStorage.setItem('last_session',session);
-    document.getElementById('messages').innerHTML='';addMsg('Новый диалог.','agent');
-}
-
-async function quick(t){document.getElementById('input').value=t;sendMessage();}
-
-function saveSSH(){
-    ssh={host:document.getElementById('ssh-host').value,user:document.getElementById('ssh-user').value,password:document.getElementById('ssh-password').value};
-    alert('SSH сохранён: '+ssh.host);
-}
-
-async function stopTask(){
-    if(!confirm('Остановить?'))return;
-    try{await fetch('/stop',{method:'POST'});}catch(e){}
-    isStreaming=false;document.getElementById('send-btn').disabled=false;
-    document.getElementById('stop-btn').style.display='none';
-    document.getElementById('status').textContent='Остановлено';addMsg('Остановлено.','agent');
-}
-
-async function loadModels(){
-    try{
-        const r=await fetch('/models');const d=await r.json();
-        const sel=document.getElementById('model-select');
-        sel.innerHTML=d.models.map(m=>'<option value="'+m+'"'+(m===d.current?' selected':'')+'>'+m+'</option>').join('');
-        document.getElementById('current-model').textContent=d.current;
-        
-        const popular=['qwen2.5-coder:7b','qwen2.5-coder:14b','qwen2.5-coder:32b','qwen2.5-coder:32b-q3_K_M','llama3.1:8b','mistral:7b'];
-        document.getElementById('models-list').innerHTML=d.models.map(m=>{
-            const isPopular=popular.includes(m);
-            return '<div class="model-item"><div class="info"><div class="name">'+m+'</div>'+
-                (isPopular?'<div class="size">Популярная</div>':'')+'</div>'+
-                (m!==d.current?'<button class="use-btn" onclick="switchModel(\\''+m+'\\')">Использовать</button>':'<span style="color:#3fb950;font-size:10px">✓ Активна</span>')+
-                (m!==d.current?'<button class="rm-btn" onclick="deleteModel(\\''+m+'\\')">🗑</button>':'')+'</div>';
-        }).join('')||'<div style="color:#8b949e;font-size:11px;text-align:center;padding:20px">Нет установленных моделей</div>';
-    }catch(e){}
-}
-
-async function switchModel(m){
-    if(!confirm('Переключить на '+m+'?'))return;
-    await stopTask();
-    try{
-        const r=await fetch('/switch_model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:m})});
-        const d=await r.json();document.getElementById('current-model').textContent=d.model;alert(d.message);
-        loadModels();
-    }catch(e){alert('Ошибка: '+e);}
-}
-
-function downloadModelByName(name){
-    document.getElementById('new-model-name').value=name;
-    downloadModel();
-}
-
-async function downloadModel(){
-    const name=document.getElementById('new-model-name').value.trim();
-    if(!name){alert('Введи имя модели');return;}
-    if(!confirm('Скачать модель '+name+'? Это займёт 5-30 минут.'))return;
-    const status=document.getElementById('download-status');
-    status.innerHTML='<div style="background:#0d1117;border:1px solid #1f6feb;border-radius:4px;padding:8px;margin-top:6px;color:#58a6ff;font-size:11px">⏳ Скачивание '+name+'...<br><span style="color:#8b949e">Не закрывай страницу</span></div>';
-    try{
-        const r=await fetch('/download_model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});
-        const d=await r.json();
-        if(d.status==='ok'){
-            status.innerHTML='<div style="background:#0d1117;border:1px solid #3fb950;border-radius:4px;padding:8px;margin-top:6px;color:#3fb950;font-size:11px">✅ '+d.message+'</div>';
-            loadModels();
-        }else{
-            status.innerHTML='<div style="background:#0d1117;border:1px solid #f85149;border-radius:4px;padding:8px;margin-top:6px;color:#f85149;font-size:11px">❌ '+d.message+'</div>';
+        else if (d.type === 'result') {
+          const cards = turn.querySelectorAll('.card'); const pre = cards[cards.length-1].querySelector('pre:last-child');
+          const rp = document.createElement('pre'); rp.textContent = d.text; cards[cards.length-1].appendChild(rp);
+          think.dataset.closed = '1'; think = thinkBlock(turn); scroll();
         }
-    }catch(e){status.innerHTML='<div style="background:#0d1117;border:1px solid #f85149;border-radius:4px;padding:8px;margin-top:6px;color:#f85149;font-size:11px">Ошибка: '+e+'</div>';}
-}
-
-async function deleteModel(name){
-    if(!confirm('Удалить модель '+name+'?'))return;
-    try{
-        const r=await fetch('/delete_model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});
-        const d=await r.json();alert(d.message);loadModels();
-    }catch(e){alert('Ошибка: '+e);}
-}
-
-async function runDiskCheck(type){
-    const panel=document.getElementById('disk-result');
-    panel.style.display='block';panel.className='disk-panel running';panel.textContent='⏳ Запуск: '+type+'...';
-    try{const r=await fetch('/disk_check?type='+type);const d=await r.json();
-        panel.className='disk-panel'+(d.error?' error':'');
-        panel.textContent=d.result||d.error||'Нет данных';
-    }catch(e){panel.className='disk-panel error';panel.textContent='Ошибка: '+e;}}
-
-async function loadSessions(){
-    const r=await fetch('/sessions');const d=await r.json();
-    document.getElementById('sessions-list').innerHTML=d.sessions.map(s=>
-        '<button class="btn" onclick="loadSession(\\''+s+'\\')" style="font-size:10px;padding:4px;margin-bottom:2px">💬 '+s+'</button>'
-    ).join('');
-}
-
-async function loadSession(id){
-    session=id;localStorage.setItem('last_session',session);
-    document.getElementById('messages').innerHTML='';
-    const r=await fetch('/load_session?session_id='+id);const d=await r.json();
-    d.history.forEach(m=>addMsg(m.content,m.role==='user'?'user':'agent'));
-    if(d.last_task){
-        addMsg('📂 Последнее действие: '+d.last_task.action+' ['+d.last_task.status+']','agent');
+        else if (d.type === 'reply') { think.dataset.closed = '1'; bubble(d.text, 'a'); }
+        else if (d.type === 'metrics') { $('hs').textContent = d.speed; $('hc').textContent = d.used + '/' + d.limit; $('hb').style.width = Math.min(100, d.used*100/d.limit) + '%'; }
+        else if (d.type === 'error') { bubble('❌ ' + d.text, 'a'); }
+        else if (d.type === 'stopped') { bubble('🛑 Остановлено', 'a'); }
+      }
     }
+  } catch(e) { if (e.message !== 'auth') bubble('❌ ' + e, 'a'); }
+  busy = false; $('sendb').disabled = false; $('stopb').style.display = 'none'; $('hst').textContent = 'Готов'; loadSessions();
 }
-
-async function loadLastSession(){
-    const r=await fetch('/last_session');const d=await r.json();
-    if(d.session_id){loadSession(d.session_id);}
-    else{alert('Нет сохранённых сессий');}
+async function stopTask() { await api('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sid})}); }
+function quick(t) { $('inp').value = t; send(); }
+async function newChat() { sid = String(Date.now()); localStorage.setItem('sid', sid); $('chat').innerHTML = ''; bubble('Новый диалог. Давай задачу.', 'a'); }
+async function loadModels() {
+  const d = await (await api('/models')).json();
+  $('hm').textContent = d.current;
+  $('msel').innerHTML = d.models.map(m => '<option ' + (m.name===d.current?'selected':'') + '>' + esc(m.name) + '</option>').join('');
+  $('mlist').innerHTML = d.models.map(m => '<div class="mi"><span>' + esc(m.name) + ' (' + m.size + ' ГБ)</span>' +
+    (m.name!==d.current ? '<button class="g" onclick="switchModel(\\''+m.name+'\\')">▶</button><button class="r" onclick="delModel(\\''+m.name+'\\')">🗑</button>' : '<b style="color:#3fb950">✓</b>') + '</div>').join('');
 }
-
-async function autoLoadLast(){
-    const saved=localStorage.getItem('last_session');
-    if(saved){
-        try{
-            const r=await fetch('/load_session?session_id='+saved);const d=await r.json();
-            if(d.history&&d.history.length>0){
-                session=saved;
-                d.history.forEach(m=>addMsg(m.content,m.role==='user'?'user':'agent'));
-                if(d.last_task){
-                    addMsg('📂 Восстановлена сессия. Последнее: '+d.last_task.action,'agent');
-                }
-            }
-        }catch(e){}
-    }
+async function switchModel(n) { const d = await (await api('/model/switch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:n})})).json(); alert(d.msg); loadModels(); }
+async function delModel(n) { if (!confirm('Удалить ' + n + '?')) return; const d = await (await api('/model/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:n})})).json(); alert(d.msg); loadModels(); }
+function pullName(n) { $('mname').value = n; pullModel(); }
+async function pullModel() {
+  const n = $('mname').value.trim(); if (!n) return alert('Введи имя модели');
+  $('pull').textContent = '⏳ ' + n + '...';
+  const r = await api('/model/pull', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:n})});
+  const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+  while (true) { const {done, value} = await rd.read(); if (done) break;
+    buf += dec.decode(value, {stream:true}); const ls = buf.split('\\n'); buf = ls.pop();
+    for (const ln of ls) if (ln.startsWith('data: ')) { const d = JSON.parse(ln.slice(6)); $('pull').textContent = (d.pct>=100?'✅ ':'⏳ ') + n + ' ' + d.pct + '% ' + d.status; } }
+  loadModels();
 }
-
-loadModels();loadSessions();autoLoadLast();
+async function sshSave() { const d = await (await api('/ssh/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host:$('sh').value, user:$('su').value, port:$('sp').value, password:$('sw').value})})).json(); alert(d.msg); }
+async function sshTest() { const d = await (await api('/ssh/test', {method:'POST'})).json(); alert(d.msg); }
+async function disk(t) { $('dres').style.display = 'block'; $('dres').querySelector('pre').textContent = '⏳ ' + t + '...'; const d = await (await api('/disk?type=' + t)).json(); $('dres').querySelector('pre').textContent = d.result; }
+async function loadSessions() { const d = await (await api('/sessions')).json(); $('sess').innerHTML = d.sessions.map(s => '<button onclick="loadSession(\\'' + s.sid + '\\')">💬 ' + s.sid + ' (' + s.n + ')</button>').join(''); }
+async function loadSession(id) { sid = id; localStorage.setItem('sid', sid); $('chat').innerHTML = ''; const d = await (await api('/session?sid=' + id)).json(); d.history.forEach(m => bubble(m.content, m.role==='user'?'u':'a')); if (d.task) bubble('Статус задачи: ' + d.task.status, 'a'); }
+async function restartAgent() { if (!confirm('Перезапустить агента?')) return; await api('/restart', {method:'POST'}); $('hst').textContent = 'Перезапуск...'; setTimeout(() => location.reload(), 4000); }
+async function init() {
+  if (BOOT.default_host) { $('sh').value = BOOT.default_host; const c = BOOT.ssh[BOOT.default_host]; if (c) { $('su').value = c.user; $('sp').value = c.port; } }
+  loadModels(); loadSessions();
+  const saved = localStorage.getItem('sid');
+  if (saved) { try { await loadSession(saved); } catch(e) {} }
+}
+init();
 </script></body></html>"""
 
-@app.route('/')
-def home():
-    sid = request.args.get('session', str(int(time.time())))
-    cfg = load_config()
-    return render_template_string(HTML, model=MODEL, session_id=sid, 
-                                  ssh_host=cfg.get("ssh_host", "192.168.0.33"),
-                                  ssh_user=cfg.get("ssh_user", "root"))
-
-@app.route('/stop', methods=['POST'])
-def stop():
-    global STOP_FLAG
-    STOP_FLAG = True
-    return jsonify({"status": "stopped"})
-
-@app.route('/models')
-def get_models():
-    try:
-        req = urllib.request.Request("http://localhost:11434/api/tags")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            models = [m["name"] for m in data.get("models", [])]
-    except: models = AVAILABLE_MODELS
-    return jsonify({"models": models, "current": MODEL})
-
-@app.route('/switch_model', methods=['POST'])
-def set_model():
-    global MODEL
-    data = request.json
-    new_model = data.get('model', MODEL)
-    old_model = MODEL
-    try:
-        req = urllib.request.Request("http://localhost:11434/api/generate",
-            data=json.dumps({"model": old_model, "keep_alive": 0}).encode(),
-            headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-    except: pass
-    MODEL = new_model
-    cfg = load_config()
-    cfg["model"] = new_model
-    save_config(cfg)
-    return jsonify({"status": "ok", "message": f"Переключено: {old_model} → {new_model}", "model": MODEL})
-
-@app.route('/download_model', methods=['POST'])
-def download_model():
-    data = request.json
-    model_name = data.get('model', '')
-    if not model_name:
-        return jsonify({"status": "error", "message": "Не указано имя модели"})
-    try:
-        proc = subprocess.Popen(f"ollama pull {model_name}", shell=True, 
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        proc.wait(timeout=600)
-        if proc.returncode == 0:
-            return jsonify({"status": "ok", "message": f"Модель {model_name} скачана"})
-        else:
-            err = proc.stderr.read().decode()
-            return jsonify({"status": "error", "message": f"Ошибка: {err}"})
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return jsonify({"status": "error", "message": "Таймаут скачивания"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-@app.route('/delete_model', methods=['POST'])
-def delete_model():
-    data = request.json
-    model_name = data.get('model', '')
-    if not model_name:
-        return jsonify({"status": "error", "message": "Не указано имя"})
-    try:
-        proc = subprocess.run(f"ollama rm {model_name}", shell=True, 
-                              capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            return jsonify({"status": "ok", "message": f"Модель {model_name} удалена"})
-        else:
-            return jsonify({"status": "error", "message": proc.stderr})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-@app.route('/disk_check')
-def disk_check_endpoint():
-    check_type = request.args.get('type', 'info')
-    try:
-        result = disk_check(check_type)
-        return jsonify({"result": result, "type": check_type})
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-@app.route('/chat/stream', methods=['POST'])
-def chat_stream():
-    global STOP_FLAG
-    STOP_FLAG = False
-    data = request.json
-    msg = data.get('message', '')
-    sid = data.get('session_id', str(int(time.time())))
-    ssh_data = data.get('ssh', {})
-    if ssh_data.get('password') and ssh_data.get('host'):
-        ssh_passwords[ssh_data['host']] = ssh_data['password']
-        cfg = load_config()
-        cfg["ssh_host"] = ssh_data['host']
-        cfg["ssh_user"] = ssh_data.get('user', 'root')
-        save_config(cfg)
-    save_msg(sid, 'user', msg)
-    save_task(sid, 'started', 'chat')
-    def generate():
-        global STOP_FLAG
-        try:
-            stream = client.chat.completions.create(model=MODEL, messages=get_history(sid), temperature=0.2, stream=True, max_tokens=2048)
-            full = ""
-            for chunk in stream:
-                if STOP_FLAG:
-                    save_task(sid, 'stopped', 'chat')
-                    save_msg(sid, 'assistant', full + " [ОСТАНОВЛЕНО]")
-                    yield f"data: {json.dumps({'type': 'stopped'})}\n\n"
-                    return
-                if chunk.choices and chunk.choices[0].delta.content:
-                    c = chunk.choices[0].delta.content
-                    full += c
-                    yield f"data: {json.dumps({'type': 'token', 'content': c})}\n\n"
-            if STOP_FLAG:
-                yield f"data: {json.dumps({'type': 'stopped'})}\n\n"
-                return
-            act = extract_json(full)
-            if act and act.get("action") and act["action"] not in ["reply", "done"]:
-                save_task(sid, 'running', act.get('action'))
-                yield f"data: {json.dumps({'type': 'action', 'action': act.get('action')})}\n\n"
-                res = handle_action(act)
-                save_task(sid, 'done', act.get('action'), res[:200])
-                yield f"data: {json.dumps({'type': 'result', 'result': res})}\n\n"
-                save_msg(sid, 'assistant', full)
-                save_msg(sid, 'user', f"Результат {act.get('action')}:\n{res}\nПродолжай.")
-                for _ in range(4):
-                    if STOP_FLAG: break
-                    try:
-                        stream2 = client.chat.completions.create(model=MODEL, messages=get_history(sid), temperature=0.2, stream=True, max_tokens=2048)
-                        full2 = ""
-                        for chunk in stream2:
-                            if STOP_FLAG: break
-                            if chunk.choices and chunk.choices[0].delta.content:
-                                c = chunk.choices[0].delta.content
-                                full2 += c
-                                yield f"data: {json.dumps({'type': 'token', 'content': c})}\n\n"
-                        if STOP_FLAG: break
-                        act2 = extract_json(full2)
-                        if act2 and act2.get("action") and act2["action"] not in ["reply", "done"]:
-                            save_task(sid, 'running', act2.get('action'))
-                            yield f"data: {json.dumps({'type': 'action', 'action': act2.get('action')})}\n\n"
-                            res2 = handle_action(act2)
-                            save_task(sid, 'done', act2.get('action'), res2[:200])
-                            yield f"data: {json.dumps({'type': 'result', 'result': res2})}\n\n"
-                            save_msg(sid, 'assistant', full2)
-                            save_msg(sid, 'user', f"Результат:\n{res2}")
-                        else:
-                            save_msg(sid, 'assistant', full2)
-                            save_task(sid, 'completed', 'done')
-                            break
-                    except Exception as e:
-                        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-                        break
-            else:
-                save_msg(sid, 'assistant', full)
-                save_task(sid, 'completed', 'reply')
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        except Exception as e:
-            save_task(sid, 'error', 'exception', str(e))
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-@app.route('/new_conversation', methods=['POST'])
-def new_conv():
-    return jsonify({"session_id": str(int(time.time()))})
-
-@app.route('/sessions')
-def sessions():
-    conn = init_db()
-    curs = conn.execute("SELECT DISTINCT session_id FROM messages ORDER BY id DESC LIMIT 20")
-    return jsonify({"sessions": [r[0] for r in curs.fetchall()]})
-
-@app.route('/last_session')
-def last_session():
-    conn = init_db()
-    curs = conn.execute("SELECT session_id FROM messages ORDER BY id DESC LIMIT 1")
-    row = curs.fetchone()
-    if row:
-        return jsonify({"session_id": row[0]})
-    return jsonify({"session_id": None})
-
-@app.route('/load_session')
-def load_session():
-    sid = request.args.get('session_id')
-    conn = init_db()
-    curs = conn.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY id ASC", (sid,))
-    history = [{"role": r[0], "content": r[1]} for r in curs.fetchall()]
-    last_task = get_last_task(sid)
-    result = {"history": history}
-    if last_task:
-        result["last_task"] = {"status": last_task[0], "action": last_task[1], "progress": last_task[2]}
-    return jsonify(result)
-
-if __name__ == '__main__':
-    init_db()
-    os.makedirs(WORKSPACE, exist_ok=True)
-    print(f"Agent running: http://0.0.0.0:8000 | Model: {MODEL}")
-    app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
+if __name__ == "__main__":
+    ensure_model()
+    print("=" * 60)
+    print("AI Agent v5 | модель:", CFG["model"])
+    print("ПАРОЛЬ ВЕБ-ИНТЕРФЕЙСА:", CFG["web_password"])
+    print("=" * 60)
+    app.run(host="0.0.0.0", port=8000, threaded=True)
