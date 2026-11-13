@@ -1,58 +1,49 @@
 #!/bin/bash
-set -e
-G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; N='\033[0m'
+# install.sh — установка с нуля, всё тянется с GitHub
+set -u
 REPO="https://raw.githubusercontent.com/vasa57kam/ag/main"
-echo -e "${B}=== AI Agent v6 install ===${N}"
-
-# 1. Диск
-ROOT_DEV=$(df / | tail -1 | awk '{print $1}')
-DISK=$(echo $ROOT_DEV | sed 's/[0-9]*$//'); PART=$(echo $ROOT_DEV | grep -oE '[0-9]+$' || echo 1)
-DS=$(lsblk -b -d -n -o SIZE $DISK 2>/dev/null || echo 0); PS=$(lsblk -b -n -o SIZE $ROOT_DEV 2>/dev/null || echo 0)
-if [ $(( (DS-PS)/1024/1024/1024 )) -gt 5 ]; then
-  apt update -qq && apt install -y -qq cloud-guest-utils
-  growpart $DISK $PART || true
-  if echo "$ROOT_DEV" | grep -q mapper; then
-    pvresize ${DISK}${PART} || true; lvextend -l +100%FREE $ROOT_DEV || true
-  fi
-  resize2fs $ROOT_DEV || true
-  echo -e "${G}диск расширен${N}"
-fi
-
-# 2. Модель
-RAM=$(free -g | awk '/^Mem:/{print $2}')
-echo -e "RAM: ${G}${RAM} ГБ${N}"
-echo "1) 32B Q4 (~22 ГБ)  2) 32B Q3 (~17 ГБ)  3) 14B (~10 ГБ)  4) 7B (~6 ГБ)"
-read -p "Модель [3]: " CH; CH=${CH:-3}
-case $CH in
- 1) MODEL=qwen2.5-coder:32b;; 2) MODEL=qwen2.5-coder:32b-q3_K_M;;
- 4) MODEL=qwen2.5-coder:7b;; *) MODEL=qwen2.5-coder:14b;;
-esac
-
-# 3. Ollama + модель
-command -v ollama >/dev/null || { curl -fsSL https://ollama.com/install.sh | bash; }
-systemctl enable --now ollama
-ollama pull $MODEL
-
-# 4. Зависимости (openai больше не нужен!)
-apt install -y -qq python3-pip sqlite3 smartmontools e2fsprogs curl git
+BASE=/opt/ai-agent
+[ "$(id -u)" = "0" ] || { echo "нужен root"; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+echo "[1/5] пакеты"
+apt-get update -qq
+apt-get install -y -qq python3-pip sqlite3 smartmontools e2fsprogs curl git cloud-guest-utils hdparm >/dev/null
 pip3 install -q flask paramiko 2>/dev/null || pip3 install -q --break-system-packages flask paramiko
 
-# 5. Агент + конфиг
-mkdir -p /opt/ai-agent/workspace
-curl -fsSL "$REPO/agent.py" -o /opt/ai-agent/agent.py
-python3 - "$MODEL" <<'PY'
-import json,sys,os
+echo "[2/5] диск"
+RD=$(df / | tail -1 | awk '{print $1}'); DK=$(echo $RD | sed 's/[0-9]*$//'); PT=$(echo $RD | grep -oE '[0-9]+$' || echo 1)
+DS=$(lsblk -b -d -n -o SIZE $DK 2>/dev/null || echo 0); PS=$(lsblk -b -n -o SIZE $RD 2>/dev/null || echo 0)
+if [ $(( (DS-PS)/1024/1024/1024 )) -gt 5 ]; then
+  growpart $DK $PT || true
+  echo "$RD" | grep -q mapper && { pvresize ${DK}${PT} || true; lvextend -l +100%FREE $RD || true; }
+  resize2fs $RD || true
+fi
+
+echo "[3/5] ollama + модель"
+command -v ollama >/dev/null 2>&1 || curl -fsSL https://ollama.com/install.sh | bash
+systemctl enable --now ollama >/dev/null 2>&1
+for i in $(seq 1 30); do curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
+RAM=$(free -g | awk '/^Mem:/{print $2}'); echo "   RAM ${RAM} ГБ"
+echo "   1) 32b(~22ГБ) 2) 32b-q3(~17ГБ) 3) 14b(~10ГБ)[рек] 4) 7b(~6ГБ)"
+read -r -p "   номер [3]: " CH </dev/tty || CH=3
+case "${CH:-3}" in 1) M=qwen2.5-coder:32b;; 2) M=qwen2.5-coder:32b-q3_K_M;; 4) M=qwen2.5-coder:7b;; *) M=qwen2.5-coder:14b;; esac
+ollama pull "$M"
+mkdir -p "$BASE/workspace"
+python3 - "$M" <<'PY'
+import json,os,sys
 p="/opt/ai-agent/config.json"; cfg={}
-if os.path.exists(p): cfg=json.load(open(p))
-cfg["model"]=sys.argv[1]; cfg.setdefault("num_ctx",0); cfg.setdefault("ssh",{}); cfg.setdefault("default_host","")
-cfg.pop("web_password",None)
-json.dump(cfg,open(p,"w"),indent=2)
+if os.path.exists(p):
+    try: cfg=json.load(open(p))
+    except Exception: cfg={}
+cfg["model"]=sys.argv[1]; cfg["num_ctx"]=0
+cfg.setdefault("ssh",{}); cfg.setdefault("default_host","")
+json.dump(cfg,open(p,"w"),indent=2); os.chmod(p,0o600)
 PY
 
-# 6. Сервис
+echo "[4/5] сервис"
 cat > /etc/systemd/system/ai-agent.service <<'EOF'
 [Unit]
-Description=AI Agent v6
+Description=AI Agent
 After=network-online.target ollama.service
 Wants=ollama.service
 [Service]
@@ -65,6 +56,9 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload && systemctl enable --now ai-agent
-sleep 2
-echo -e "${G}ГОТОВО: http://$(hostname -I | awk '{print $1}'):8000 | модель $MODEL${N}"
+systemctl daemon-reload; systemctl enable ai-agent >/dev/null 2>&1
+
+echo "[5/5] код с GitHub"
+curl -fsSL "$REPO/update.sh" -o "$BASE/update.sh" && bash "$BASE/update.sh"
+cp "$BASE/update.sh" /usr/local/bin/agent-update 2>/dev/null && chmod +x /usr/local/bin/agent-update
+echo "Готово. Обновление в будущем: agent-update"
